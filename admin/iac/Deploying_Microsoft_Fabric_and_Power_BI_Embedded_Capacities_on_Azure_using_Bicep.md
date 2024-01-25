@@ -5,7 +5,7 @@ I have tested Bicep deployment samples that are specifically tailored for Azure 
 
 [microsoft_fabric_capacity_azure_deploy.bicep](https://github.com/dcnsakthi/fabric/blob/main/admin/iac/microsoft_fabric_capacity_azure_deploy.bicep)
 
-#### Bicep Response from VSCode:
+#### Bicep Result in VSCode:
 <img width="836" alt="image" src="https://github.com/dcnsakthi/fabric/assets/17950332/97dabf67-f2f6-4d05-9394-1741c2bdfafe">
 
 #### Azure Portal View:
@@ -15,7 +15,7 @@ I have tested Bicep deployment samples that are specifically tailored for Azure 
 
 [microsoft_powerbi_embedded_capacity_azure_deploy.bicep](https://github.com/dcnsakthi/fabric/blob/main/admin/iac/microsoft_powerbi_embedded_capacity_azure_deploy.bicep))
 
-#### Bicep Response from VSCode:
+#### Bicep Result in VSCode:
 <img width="836" alt="image" src="https://github.com/dcnsakthi/fabric/assets/17950332/29c2df64-31a8-46f4-bac1-83e920b37d11">
 
 #### Azure Portal View:
