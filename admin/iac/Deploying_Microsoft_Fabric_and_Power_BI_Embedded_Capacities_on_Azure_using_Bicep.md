@@ -1,4 +1,6 @@
 # Deploying Microsoft Fabric and Power BI Embedded Capacities on Azure using Bicep)
+
+[Bicep using VSCode] (https://learn.microsoft.com/en-us/azure/azure-resource-manager/bicep/visual-studio-code)
 I have tested Bicep deployment samples that are specifically tailored for Azure Developers and Administrators, with a specific emphasis on Microsoft Fabric and Power BI Embedded Azure Capacity.
 
 ### Bicep Deployment Script for Azure Fabric Capacity
