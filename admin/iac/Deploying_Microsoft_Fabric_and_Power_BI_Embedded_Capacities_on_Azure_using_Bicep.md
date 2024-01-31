@@ -1,4 +1,4 @@
-# Deploying Microsoft Fabric and Power BI Embedded Capacities on Azure using Bicep)
+# Deploying Microsoft Fabric and Power BI Embedded Capacities on Azure using Bicep
 
 I have tested Bicep deployment samples that are specifically tailored for Azure Developers and Administrators, with a specific emphasis on Microsoft Fabric and Power BI Embedded Azure Capacity.
 
