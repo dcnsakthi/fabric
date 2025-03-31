@@ -1,0 +1,22 @@
+Count_Tax_Per_Year_And_SelectedDateRange = 
+VAR SelectedStartDate = MIN('Calendar (2)'[Date])  -- Get the start date of the selected range from the slicer (Calendar (2))
+VAR SelectedEndDate = MAX('Calendar (2)'[Date])    -- Get the end date of the selected range from the slicer (Calendar (2))
+
+VAR StartMonthDay = DATE(MAX('Calendar'[Year]), MONTH(SelectedStartDate), DAY(SelectedStartDate))  -- Extract the month and day from SelectedStartDate for the selected year
+VAR EndMonthDay = DATE(MAX('Calendar'[Year]), MONTH(SelectedEndDate), DAY(SelectedEndDate))  -- Extract the month and day from SelectedEndDate for the selected year
+
+VAR SelectedYears = VALUES('Calendar'[Year])  -- Get the years selected in the Year slicer (from Calendar table)
+
+RETURN
+    SUMX(
+        SelectedYears,  -- Iterate over each selected year in the slicer (from Calendar table)
+        CALCULATE(
+            SUM(FilingData[Count]),  -- Sum the filing counts from FilingData table
+            -- Filter for the specific year from the year slicer (from Calendar)
+            'Calendar'[Year] = EARLIER('Calendar'[Year]),  -- Filter FilingData for the respective year
+            -- Apply the date range filter for the selected year (from Calendar (2) slicer)
+            'Calendar'[Date] >= DATE(EARLIER('Calendar'[Year]), MONTH(StartMonthDay), DAY(StartMonthDay)) &&  -- Start date of selected year
+            'Calendar'[Date] <= DATE(EARLIER('Calendar'[Year]), MONTH(EndMonthDay), DAY(EndMonthDay)) &&  -- End date of selected year
+            'Calendar'[Date] >= StartMonthDay && 'Calendar'[Date] <= EndMonthDay  -- Apply selected date range from Calendar (2)
+        )
+    )
