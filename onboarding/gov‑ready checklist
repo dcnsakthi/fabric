@@ -1,0 +1,113 @@
+# 🏛️ Microsoft Fabric – Government / Restricted Environment (Gov‑Ready)
+---
+
+## 🔐 1. Tenant & Platform Foundation
+- [ ] Azure Subscription + required services (Fabric, Purview, Key Vault) enabled  
+- [ ] Microsoft Fabric tenant enabled (Admin Portal)  
+- [ ] Fabric Capacity provisioned (central / agency-specific)  
+- [ ] Fabric Admin role assigned  
+
+---
+
+## 👤 2. Identity & Access Security (Zero Trust)
+- [ ] Entra ID hardened (MFA + Conditional Access + PIM)  
+- [ ] Access restricted to approved gov users only  
+- [ ] Service Principals enabled for CI/CD pipelines  
+- [ ] Device / network-based access enforcement  
+
+---
+
+## 🌐 3. Network Isolation & Connectivity
+- [ ] Private Link / Private Endpoint enforced (tenant-wide)  
+- [ ] Public Internet Access blocked (restricted environments)  
+- [ ] FQDN allow‑listing for Fabric / Power BI endpoints  
+- [ ] All data access routed via VNet / Gateway (no direct cloud access)  
+
+---
+
+## 🔑 4. Data Security & Encryption
+- [ ] Customer Managed Keys (CMK) via Azure Key Vault (recommended)  
+- [ ] Secrets stored in Key Vault (no hardcoding)  
+- [ ] Encryption enforced (BYOK where required)  
+
+---
+
+## 🛡️ 5. Governance, Compliance & Audit
+- [ ] Microsoft Purview onboarded (mandatory)
+  - [ ] Sensitivity labels  
+  - [ ] Mandatory classification  
+  - [ ] Data lineage  
+  - [ ] Audit logging enabled  
+- [ ] Data Loss Prevention (DLP) policies configured  
+- [ ] Tenant / Domain / Workspace governance model defined  
+
+---
+
+## ⚙️ 6. Tenant Hardening (Fabric / Power BI)
+- [ ] External sharing restricted / disabled  
+- [ ] “Publish to Web” disabled  
+- [ ] Export / download controls enforced  
+- [ ] Access controlled via security groups (not tenant-wide enablement)  
+
+---
+
+## 🧱 7. Workspace & Environment Design
+- [ ] Dev / Test / Prod separation  
+- [ ] Domain-based workspace segmentation (agency / business units)  
+- [ ] RBAC / RLS implemented  
+- [ ] Workspace-level firewall + private endpoints applied  
+
+---
+
+## 🔌 8. Secure Data Integration
+
+### Dataverse → OneLake
+- [ ] Same-tenant integration + admin consent  
+- [ ] Table-level security review completed  
+
+### On-Prem / Gov Network Ingestion
+- [ ] Data Gateway / Self-hosted IR deployed  
+- [ ] Approved VNet / SFTP connectivity  
+- [ ] No public ingestion endpoints  
+
+---
+
+## 🚀 9. DevOps & Deployment
+- [ ] Azure DevOps / Git integration enabled  
+- [ ] CI/CD pipelines via Service Principal  
+- [ ] Controlled promotion across environments  
+
+---
+
+## 💼 10. Licensing & Capacity
+- [ ] Fabric Capacity (F / P SKU) provisioned  
+- [ ] Power BI licenses assigned for developers  
+
+---
+
+## ⚠️ 11. Gov-Specific Constraints (Validate Early)
+- [ ] Region availability confirmed  
+- [ ] Data residency & classification rules validated  
+- [ ] Sensitive data restricted to approved boundaries  
+
+---
+
+## 🚫 12. Known Trade-offs in Restricted Mode
+- [ ] Limited features with Private Link / no internet:
+  - [ ] Export / subscriptions  
+  - [ ] Certain SaaS capabilities  
+  - [ ] Copilot limitations  
+
+---
+
+# 🔑 Executive Decision Gate (Go/No-Go)
+✅ All must be completed before go-live:
+- [ ] Identity & Network security baseline  
+- [ ] Purview governance enforced  
+- [ ] Tenant hardening completed  
+- [ ] Secure connectivity (gateway/private only)  
+- [ ] Compliance validation signed off  
+
+---
+
+**Fabric for Gov = SaaS platform with PaaS-level control (Identity + Network + Data Governance fully locked down)**
