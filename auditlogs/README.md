@@ -15,10 +15,6 @@ Extract-FabricAuditLogs.ps1        ← the whole extractor (single file)
 config-keyvault.json               ← Key Vault variant config
 README.md                          ← you are here
 ```
-
-> **Production:** use the Key Vault variant. `setx /M` stores the secret in clear
-> text in the registry. See `README-KeyVault.md`.
-
 ---
 
 ## Why not `Search-UnifiedAuditLog`?
