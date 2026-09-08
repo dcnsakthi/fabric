@@ -15,6 +15,10 @@ Extract-FabricAuditLogs.ps1        ← the whole extractor (single file)
 config-keyvault.json               ← Key Vault variant config
 README.md                          ← you are here
 ```
+
+> **Production:** use the Key Vault variant. `setx /M` stores the secret in clear
+> text in the registry. See `README-KeyVault.md`.
+
 ---
 
 ## Why not `Search-UnifiedAuditLog`?
@@ -37,7 +41,7 @@ Entra admin center → App registrations → New registration → *Fabric Audit 
 | Office 365 Management APIs | `ActivityFeed.Read` | read the unified audit feed |
 | Microsoft Graph | `AdministrativeUnit.Read.All` | list AU members |
 | Microsoft Graph | `User.Read.All` | **required** — read each member's `userPrincipalName`. Without it Graph returns the AU member objects but strips every user property, so nothing can be matched and all records land in `Unassigned` |
-| Microsoft Graph | `GroupMember.Read.All` | *only* if your AUs contain groups |
+| Microsoft Graph | `GroupMember.Read.All` | **required** for `securityGroups[]`, and for AUs that contain groups. Reads `transitiveMembers`, so nested groups resolve to their users |
 
 That is the full set. **No** Azure RBAC role, **no** Entra directory role, **no**
 Exchange role, **no** `Directory.Read.All`.
@@ -92,6 +96,7 @@ Edit `config.json`:
 | `includeCurrentDay` | `false` (default) — exports cover the last *completed* period. Set `true` to extend every export to the partial current day. Equivalent to passing `-IncludeToday` on every run. **Ignored for any AU that sets its own `periodMode`** |
 | `audit` | which API feeds to subscribe to and which records to keep — see [What gets extracted](#what-gets-extracted). Omit the block for the Fabric / Power BI defaults |
 | `administrativeUnits[]` | `name`, `auId`, `outputPath`, `schedule` (`Daily`/`Weekly`/`Monthly`/`Custom`), `enabled`, and the optional `periodMode` / `weekStartsOn` / `rollingDays` / `rollingIncludesToday` covered below. `Custom` additionally takes `periodStart` and an optional `periodEnd`, both `yyyy-MM-dd` |
+| `securityGroups[]` | same entry shape, with `groupId` in place of `auId`. Optional — omit the block entirely if you only export by AU |
 
 Find your AU object IDs:
 ```powershell
@@ -109,6 +114,55 @@ An AU with no members is fine: it logs `0 members mapped` and, with
 
 Add, remove, or re-schedule an agency by editing `administrativeUnits[]` only —
 no code change.
+
+### Extracting by security group
+
+Some activity does not follow the AU boundary — a Fabric creators group, a tenant
+admin group, a cross-agency project team. List those under `securityGroups[]`:
+
+```json
+"securityGroups": [
+  {
+    "name": "FabricCreators",
+    "groupId": "66666666-6666-6666-6666-666666666666",
+    "outputPath": "D:\\Shares\\FabricCreators\\FabricAudit",
+    "schedule": "Weekly",
+    "periodMode": "Last7Days",
+    "enabled": true
+  }
+]
+```
+
+Everything else — `schedule`, `periodMode`, `weekStartsOn`, `rollingDays`,
+`enabled`, retention, the `_LATEST.json` trigger, the file naming — behaves exactly
+as it does for an AU. Only the directory key differs.
+
+**Nested groups are flattened.** Membership is read from Graph
+`transitiveMembers`, so a user who sits in a child group three levels below the
+configured root group is still attributed to that root group. Point the config at
+the root and let Graph walk the tree.
+
+Find your group object IDs:
+```powershell
+Connect-MgGraph -Scopes Group.Read.All
+Get-MgGroup -Filter "securityEnabled eq true" -All | Select Id, DisplayName
+```
+
+AU and security group scopes are independent, not exclusive. Every row carries
+both an `AdministrativeUnit` and a `SecurityGroup` column, so the same event can
+appear in one agency's AU export *and* in a security group export. Where a user
+belongs to several groups the first matching entry in config order wins — the
+same rule that already applies to overlapping AUs. A user in neither is reported
+as `Unassigned` in both columns.
+
+> Adding this feature adds two columns to the raw store, and a newly added scope
+> has to be applied to history that was already ingested. The raw store records a
+> fingerprint of the resolved membership in `stateFile`; when that fingerprint
+> changes — a new scope, a new group member, someone leaving an AU — the next run
+> re-tags the affected `raw\yyyy-MM-dd.csv` files in place and logs
+> `N row(s) re-tagged`. Nothing is re-fetched and no history is lost. Without
+> this a group added today would only ever see records collected from today
+> onward, because the API retains just 7 days of feed content.
 
 ### What gets extracted
 
@@ -251,7 +305,7 @@ $env:FABRIC_AUDIT_CLIENT_SECRET = '<secret>'
 # dry run — fetches and maps, writes nothing to agency shares
 .\Extract-FabricAuditLogs.ps1 -WhatIfExport
 
-# diagnose Administrative Unit membership (no audit fetch, no files written)
+# diagnose Administrative Unit and security group membership (no audit fetch, no files written)
 .\Extract-FabricAuditLogs.ps1 -DiagnoseAu
 
 # normal run
@@ -268,6 +322,9 @@ $env:FABRIC_AUDIT_CLIENT_SECRET = '<secret>'
 
 # re-export several named agencies
 .\Extract-FabricAuditLogs.ps1 -AdministrativeUnit AU2,EAGARCH -Force
+
+# re-export a single security group; AUs and other groups are untouched
+.\Extract-FabricAuditLogs.ps1 -SecurityGroup FabricCreators -Force
 
 # validation run — include today's partial day so you get output immediately
 .\Extract-FabricAuditLogs.ps1 -Force -IncludeToday
@@ -356,7 +413,7 @@ AU immune to `includeCurrentDay` and `-IncludeToday`.
 The resolved mode is echoed in the log and in `_LATEST.json`:
 
 ```
-AU 'AU2' (Weekly/Last7Days): 412 rows for 2026-08-12..2026-08-18 -> ...
+AdministrativeUnit 'AU2' (Weekly/Last7Days): 412 rows for 2026-08-12..2026-08-18 -> ...
 ```
 
 ### Custom ranges
@@ -415,18 +472,21 @@ land on a Monday — if Monday's run is missed (server down, task disabled, holi
 the next run catches up and writes that week. Once written, later runs skip it:
 
 ```
-AU 'AU2' (Weekly): 2026-08-10..2026-08-16 already exported - skipped.
+AdministrativeUnit 'AU2' (Weekly): 2026-08-10..2026-08-16 already exported - skipped.
 ```
 
 To re-issue a period that was already written, delete its entry from `exports` in
 `stateFile`, or run with `-Force`.
 
-`-AdministrativeUnit` narrows a re-export to one or more agencies by their config
+`-AdministrativeUnit` and `-SecurityGroup` narrow a re-export to one or more scopes
+by their config
 `name`, so a correction for a single agency does not rewrite every other agency's
 file or disturb its recorded export state. Names are validated against
 `config.json` up front, and an unknown name fails immediately with the list of
-valid ones rather than silently exporting nothing. The switch scopes the export
-stage only: AU membership is still resolved for every enabled AU, because the
+valid ones rather than silently exporting nothing. Naming one kind excludes the
+other: `-AdministrativeUnit AU2` exports AU2 and no security groups at all. The
+switches scope the export
+stage only: membership is still resolved for every enabled scope, because the
 central raw store is shared and skipping resolution would tag other agencies'
 records as `Unassigned`. While a filter is active the `Unassigned` file is not
 rewritten either, keeping the run limited to what you asked for.
@@ -436,7 +496,7 @@ all the audit data it just fetched belongs to today, and today is not exported y
 The log says so explicitly:
 
 ```
-AU 'AU2' (Daily): 0 rows for 2026-08-17..2026-08-17 - nothing written.
+AdministrativeUnit 'AU2' (Daily): 0 rows for 2026-08-17..2026-08-17 - nothing written.
 ```
 
 That is correct behaviour, not a failure. To see output right away, add
@@ -510,7 +570,7 @@ _LATEST.json          ← trigger + row count, for event-driven Power BI refresh
 ```
 
 65 columns, including: `CreationTimeUtc`, `Operation`, `Category`, `RiskScore`,
-`UserId`, `AdministrativeUnit`, `Department`, `WorkspaceName`, `ReportName`,
+`UserId`, `AdministrativeUnit`, `SecurityGroup`, `Department`, `WorkspaceName`, `ReportName`,
 `DatasetName`, `CapacityName`, `ArtifactKind`, `SharingRecipients`,
 `SharingScope`, `SensitivityLabelId`, `GatewayName`, `ClientIP`, `UserAgent`,
 `IsSuccess`, `IsGuest`, `IsServicePrincipal`, `RawJson`.
@@ -561,18 +621,24 @@ Then follow `PowerBI-Model.md`.
 | Added a `recordTypes` entry, still nothing collected | That record type ships on a feed you haven't subscribed to. Check the feed column in [Record types worth knowing](#record-types-worth-knowing) and add it to `contentTypes` |
 | `Record filter is OFF ...` warning | Both `audit.workloads` and `audit.recordTypes` are empty, so every record in the subscribed feeds is stored. Intentional for discovery runs; a mistake in production |
 | New feed added, first run returns nothing | A brand-new subscription can take up to 12 hours to produce its first content blob. Re-run later |
-| `cannot read user <guid> - 403 (Forbidden)` <br> `NO AU MEMBERS COULD BE RESOLVED.` | **`User.Read.All` (application) is missing.** This is the #1 cause of everything landing in `Unassigned`. See §1 |
-| `AU 'X': N object(s) had no readable userPrincipalName` | Same cause as above — Graph returned the member but withheld its properties |
-| `AU 'X': auId is not a valid GUID` | Malformed `auId` in `config.json`. Copy the AU **Object ID** exactly from Entra (8-4-4-4-12 hex) |
-| `AU 'X': directory returned 0 user object(s)` | The AU genuinely has no members, or the `auId` points at a different AU. Verify in Entra; run `-DiagnoseAu` |
+| `cannot read user <guid> - 403 (Forbidden)` <br> `NO SCOPE MEMBERS COULD BE RESOLVED.` | **`User.Read.All` (application) is missing.** This is the #1 cause of everything landing in `Unassigned`. See §1 |
+| `AdministrativeUnit 'X': N object(s) had no readable userPrincipalName` | Same cause as above — Graph returned the member but withheld its properties |
+| `AdministrativeUnit 'X': id is not a valid GUID` | Malformed `auId` in `config.json`. Copy the AU **Object ID** exactly from Entra (8-4-4-4-12 hex) |
+| `SecurityGroup 'X': id is not a valid GUID` | Malformed `groupId`. Copy the group **Object ID** exactly from Entra |
+| `AdministrativeUnit 'X': directory returned 0 user object(s)` | The AU genuinely has no members, or the `auId` points at a different AU. Verify in Entra; run `-DiagnoseAu` |
+| `SecurityGroup 'X': cannot expand ...` / 403 on `transitiveMembers` | `GroupMember.Read.All` is missing as an **application** permission |
+| A configured scope produces no log lines at all | Its `enabled` is `false`. The run now warns `<Kind> 'X': enabled is false - not resolved and not exported` |
 | Members map, but records still `Unassigned` | Identity mismatch, not permissions. Compare the `unmatched user:` lines in the log against the members' UPNs — the audit `UserId` may be an alias or a different domain |
 | `unmatched: 00000009-0000-...` style GUIDs | Service principals / Microsoft first-party apps. They never belong to an AU; the log classifies them separately and this is expected |
 | Blank AU membership, no error | `AdministrativeUnit.Read.All` granted as *delegated* instead of *application*, or admin consent never granted |
-| `AU 'X' (Daily): 0 rows for <date> - nothing written` | Working as designed — a Daily export covers *yesterday*, and your data is from today. Add `-IncludeToday` (with `-Force` if needed), or set `includeCurrentDay: true` |
-| `AU 'X' (Weekly): <period> already exported - skipped` | That period's file was written on an earlier run. Delete its entry from `exports` in `stateFile`, or use `-Force`, to re-issue it |
+| `AdministrativeUnit 'X' (Daily): 0 rows for <date> - nothing written` | Working as designed — a Daily export covers *yesterday*, and your data is from today. Add `-IncludeToday` (with `-Force` if needed), or set `includeCurrentDay: true` |
+| `AdministrativeUnit 'X' (Weekly): <period> already exported - skipped` | That period's file was written on an earlier run. Delete its entry from `exports` in `stateFile`, or use `-Force`, to re-issue it |
 | Weekly and monthly files contain identical rows | Overlapping windows. Usually `includeCurrentDay: true`, which turns both defaults into to-date windows, or a `WeekToDate` + `MonthToDate` pairing. Set an explicit `periodMode` per AU — `PreviousWeek` + `PreviousMonth` never overlap |
-| `AU 'X': periodMode 'WeekToDate' describes a Weekly window but schedule is 'Monthly'` | The mode and the cadence disagree. Use `MonthToDate`, or change `schedule` to `Weekly` |
-| `AU 'X': unknown periodMode '...'` | Typo. The message lists every valid value |
+| `Scope 'X': periodMode 'WeekToDate' describes a Weekly window but schedule is 'Monthly'` | The mode and the cadence disagree. Use `MonthToDate`, or change `schedule` to `Weekly` |
+| `Scope 'X': unknown periodMode '...'` | Typo. The message lists every valid value |
+| `config.json: securityGroups 'X' is missing 'groupId'` | Every scope entry needs `name`, its id key (`auId` or `groupId`), and `outputPath` |
+| `Raw <date>: N row(s) re-tagged` | Expected after any membership or scope change — stored rows are being re-attributed in place. No data is lost and nothing is re-fetched |
+| A new scope exports 0 rows even though members mapped | The re-tag has not run yet. It is skipped when any scope failed to resolve that run (logged as a WARN), so history is never blanked from a partial Graph read. Re-run once every scope resolves cleanly |
 | Zero-row agency CSVs appearing | Set `skipEmptyExports` to `true` (the default) to suppress them |
 | Missing very recent events | Normal — Microsoft's audit pipeline lags 30 min to ~24 h; the 26-hour default lookback absorbs this |
 
