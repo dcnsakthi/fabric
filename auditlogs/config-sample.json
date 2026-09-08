@@ -42,5 +42,22 @@
       "schedule": "Daily",
       "enabled": true
     }
+  ],
+  "securityGroups": [
+    {
+      "name": "SG1",
+      "groupId": "555555555-5555-5555-5555-55555555555555",
+      "outputPath": "LogExtracts\\SG1",
+      "schedule": "Weekly",
+      "periodMode": "Last7Days",
+      "enabled": true
+    },
+    {
+      "name": "SG2",
+      "groupId": "66666666-6666-6666-66666-6666666666666",
+      "outputPath": "LogExtracts\\SG2",
+      "schedule": "Daily",
+      "enabled": true
+    }
   ]
 }
