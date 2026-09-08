@@ -4,8 +4,8 @@
 <#
 .SYNOPSIS
     Extracts Microsoft Fabric / Power BI unified audit logs from the Office 365
-    Management Activity API and writes per-Administrative-Unit CSV files to each
-    agency's shared drive, ready for Power BI consumption.
+    Management Activity API and writes per-Administrative-Unit and per-security-group
+    CSV files to each agency's shared drive, ready for Power BI consumption.
 
 .DESCRIPTION
     Single-file, app-only (client id + secret) extractor. No Exchange module,
@@ -17,10 +17,19 @@
       3. Pull all content blobs since the last watermark and keep the records
          matching audit.workloads / audit.recordTypes.
       4. Append them to a central daily raw store (de-duplicated by record Id).
-      5. Resolve each Administrative Unit's members via Graph and, for every AU
-         that is due today (Daily / Weekly / Monthly), write a CSV covering that
-         AU's period into the agency's configured share, plus a trigger file so
-         Power BI can refresh as soon as the file lands.
+      5. Resolve every configured scope's members via Graph - Administrative Units
+         from 'administrativeUnits', security groups from 'securityGroups' - and,
+         for each scope that is due today (Daily / Weekly / Monthly), write a CSV
+         covering that scope's period into its configured share, plus a trigger
+         file so Power BI can refresh as soon as the file lands.
+
+    Both scope kinds take the same entry shape (name, outputPath, schedule,
+    periodMode, enabled); only the directory key differs - 'auId' for an
+    Administrative Unit, 'groupId' for a security group. Security groups are
+    expanded transitively, so a user nested any number of groups below the root
+    group is attributed to that root group. Every row carries both an
+    AdministrativeUnit and a SecurityGroup column, so the two scopes overlap
+    freely and a user in neither is reported as Unassigned.
 
     The 'audit' config block sets what is collected. Omit it for the shipped
     Fabric / Power BI scope:
@@ -46,7 +55,10 @@
                                  User.Read.All          (REQUIRED - without it Graph returns AU
                                                          members with no userPrincipalName and
                                                          every record lands in Unassigned)
-                                 GroupMember.Read.All   (only if AUs contain groups)
+                                 GroupMember.Read.All   (REQUIRED for 'securityGroups', and for
+                                                         AUs that contain groups)
+                                 Group.Read.All         (only if GroupMember.Read.All alone cannot
+                                                         read the configured groups)
     No Azure RBAC role and no Exchange/Entra directory role is required.
 
 .EXAMPLE
@@ -68,6 +80,10 @@
     .\Extract-FabricAuditLogs.ps1 -AdministrativeUnit SolnArc -Force
 
 .EXAMPLE
+    # Re-export one security group (nested groups included) and nothing else
+    .\Extract-FabricAuditLogs.ps1 -SecurityGroup FabricCreators -Force
+
+.EXAMPLE
     # Register the daily automation (runs 02:00, covers all schedules)
     .\Extract-FabricAuditLogs.ps1 -RegisterScheduledTask -RunTime 02:00
 #>
@@ -76,11 +92,12 @@ param(
     [string]   $ConfigPath = (Join-Path $PSScriptRoot 'config.json'),
     [datetime] $StartUtc,
     [datetime] $EndUtc,
-    [string[]] $AdministrativeUnit,    # restrict exports to these config names; default = all
+    [string[]] $AdministrativeUnit,    # restrict exports to these administrativeUnits names; default = all
+    [string[]] $SecurityGroup,         # restrict exports to these securityGroups names; default = all
     [switch]   $Force,                 # ignore watermark / schedule gating
     [switch]   $WhatIfExport,          # do everything except write agency CSVs
     [switch]   $IncludeToday,         # extend the period to today for AUs with no periodMode
-    [switch]   $DiagnoseAu,            # probe AU membership via Graph, then exit
+    [switch]   $DiagnoseAu,            # probe AU and security group membership via Graph, then exit
     [switch]   $RegisterScheduledTask,
     [string]   $RunTime = '02:00'
 )
@@ -148,13 +165,13 @@ function Resolve-PeriodMode {
 
     $name = @($script:PeriodModes.Keys | Where-Object { $_ -eq $raw }) | Select-Object -First 1
     if (-not $name) {
-        throw "AU '$($Au.name)': unknown periodMode '$raw'. Valid values: $($script:PeriodModes.Keys -join ', ')."
+        throw "Scope '$($Au.name)': unknown periodMode '$raw'. Valid values: $($script:PeriodModes.Keys -join ', ')."
     }
     $spec = $script:PeriodModes[$name]
 
-    # A week-shaped alias on a Monthly AU (or the reverse) is always a config mistake.
+    # A week-shaped alias on a Monthly scope (or the reverse) is always a config mistake.
     if ($spec.ContainsKey('Schedule') -and $Schedule -in 'Weekly', 'Monthly' -and $spec.Schedule -ne $Schedule) {
-        throw "AU '$($Au.name)': periodMode '$name' describes a $($spec.Schedule) window but schedule is '$Schedule'."
+        throw "Scope '$($Au.name)': periodMode '$name' describes a $($spec.Schedule) window but schedule is '$Schedule'."
     }
 
     $days = if ($spec.ContainsKey('Days')) { [int]$spec.Days } else { switch ($Schedule) { 'Monthly' { 30 } 'Weekly' { 7 } default { 1 } } }
@@ -165,7 +182,7 @@ function Resolve-PeriodMode {
         $n = Get-Prop $Au 'rollingDays'
         if ($null -ne $n -and "$n" -ne '') {
             $days = [int]$n
-            if ($days -lt 1) { throw "AU '$($Au.name)': rollingDays must be 1 or greater, got '$n'." }
+            if ($days -lt 1) { throw "Scope '$($Au.name)': rollingDays must be 1 or greater, got '$n'." }
         }
         $i = Get-Prop $Au 'rollingIncludesToday'
         if ($null -ne $i) { $incl = [bool]$i }
@@ -195,37 +212,75 @@ foreach ($k in 'tenantId', 'clientId', 'clientSecretEnvVar', 'centralPath', 'sta
     if (-not ($cfg.PSObject.Properties.Name -contains $k)) { throw "config.json is missing required key '$k'." }
 }
 
-# AU selection narrows only the export stage. Membership resolution always covers every
-# enabled AU, otherwise unselected agencies' records would be written to the shared raw
-# store tagged 'Unassigned'.
-$script:AuFilter = $null
-if ($AdministrativeUnit) {
-    $known   = @($cfg.administrativeUnits | ForEach-Object { [string]$_.name })
-    $unknown = @($AdministrativeUnit | Where-Object { $known -notcontains $_ })
-    if ($unknown.Count) {
-        throw "Unknown administrative unit name(s): $($unknown -join ', '). Configured names: $($known -join ', ')."
+# Administrative Units and security groups are exported by identical machinery - only
+# the Graph call that resolves their members differs - so both are flattened into one
+# scope list. Kind travels with each scope and decides the directory lookup, the row
+# column that carries the tag, and the export-state key.
+$script:Scopes = New-Object System.Collections.Generic.List[object]
+function Add-ConfigScopes {
+    param([string]$Kind, [string]$ConfigKey, [string]$IdProperty)
+    if ($cfg.PSObject.Properties.Name -notcontains $ConfigKey) { return }
+    foreach ($s in @($cfg.$ConfigKey)) {
+        $nm = [string](Get-Prop $s 'name')
+        if (-not $nm) { throw "config.json: every '$ConfigKey' entry needs a 'name'." }
+        foreach ($req in $IdProperty, 'outputPath') {
+            if (-not [string](Get-Prop $s $req)) { throw "config.json: $ConfigKey '$nm' is missing '$req'." }
+        }
+        $script:Scopes.Add([pscustomobject]@{
+            Kind    = $Kind
+            Name    = $nm
+            Id      = [string](Get-Prop $s $IdProperty)
+            Enabled = [bool](Get-Prop $s 'enabled')
+            Config  = $s
+        })
     }
-    $script:AuFilter = @($AdministrativeUnit)
 }
-function Test-AuSelected { param($Au) (-not $script:AuFilter) -or ($script:AuFilter -contains [string]$Au.name) }
+Add-ConfigScopes -Kind 'AdministrativeUnit' -ConfigKey 'administrativeUnits' -IdProperty 'auId'
+Add-ConfigScopes -Kind 'SecurityGroup'      -ConfigKey 'securityGroups'      -IdProperty 'groupId'
+
+# Scope selection narrows only the export stage. Membership resolution always covers
+# every enabled scope, otherwise unselected agencies' records would be written to the
+# shared raw store tagged 'Unassigned'.
+$script:ScopeFilter = @{}
+function Set-ScopeFilter {
+    param([string]$Kind, [string[]]$Names, [string]$Label)
+    if (-not $Names) { return }
+    $known   = @($script:Scopes | Where-Object Kind -eq $Kind | ForEach-Object Name)
+    $unknown = @($Names | Where-Object { $known -notcontains $_ })
+    if ($unknown.Count) {
+        throw "Unknown $Label name(s): $($unknown -join ', '). Configured names: $($known -join ', ')."
+    }
+    $script:ScopeFilter[$Kind] = @($Names)
+}
+Set-ScopeFilter -Kind 'AdministrativeUnit' -Names $AdministrativeUnit -Label 'administrative unit'
+Set-ScopeFilter -Kind 'SecurityGroup'      -Names $SecurityGroup      -Label 'security group'
+# Naming one kind excludes the other entirely - '-AdministrativeUnit X' means "export X
+# and nothing else", not "export X plus every security group".
+function Test-ScopeSelected {
+    param($Scope)
+    if ($script:ScopeFilter.Count -eq 0) { return $true }
+    if (-not $script:ScopeFilter.ContainsKey($Scope.Kind)) { return $false }
+    $script:ScopeFilter[$Scope.Kind] -contains $Scope.Name
+}
 
 # Caught here rather than in Get-Period, where an unrecognised value would silently
 # fall through to the Daily branch.
-foreach ($a in @($cfg.administrativeUnits)) {
+foreach ($scope in $script:Scopes) {
+    $a = $scope.Config
     $m = if ($a.PSObject.Properties.Name -contains 'schedule' -and $a.schedule) { [string]$a.schedule } else { 'Daily' }
     if ($m -notin 'Daily', 'Weekly', 'Monthly', 'Custom') {
-        throw "AU '$($a.name)': unknown schedule '$m'. Valid values: Daily, Weekly, Monthly, Custom."
+        throw "$($scope.Kind) '$($scope.Name)': unknown schedule '$m'. Valid values: Daily, Weekly, Monthly, Custom."
     }
     $pm = [string](Get-Prop $a 'periodMode')
     if ($m -eq 'Custom' -and $pm) {
-        throw "AU '$($a.name)': schedule 'Custom' exports periodStart..periodEnd verbatim - remove periodMode '$pm'."
+        throw "$($scope.Kind) '$($scope.Name)': schedule 'Custom' exports periodStart..periodEnd verbatim - remove periodMode '$pm'."
     }
     if ($m -ne 'Custom') { Resolve-PeriodMode -Au $a -Schedule $m | Out-Null }
     $ws = [string](Get-Prop $a 'weekStartsOn')
     if ($ws) {
         $dowRef = [DayOfWeek]::Monday
         if (-not [enum]::TryParse([DayOfWeek], $ws, $true, [ref]$dowRef)) {
-            throw "AU '$($a.name)': weekStartsOn '$ws' is not a day name (Sunday..Saturday)."
+            throw "$($scope.Kind) '$($scope.Name)': weekStartsOn '$ws' is not a day name (Sunday..Saturday)."
         }
     }
 }
@@ -357,25 +412,37 @@ $MgmtBase = "$MgmtRes/api/v1.0/$($cfg.tenantId)/activity/feed"
 
 # ------------------------------------------------------- AU diagnostics ---
 if ($DiagnoseAu) {
-    Write-Log '=== Administrative Unit diagnostics ===' 'OK'
-    foreach ($au in @($cfg.administrativeUnits | Where-Object { $_.enabled } | Where-Object { Test-AuSelected $_ })) {
+    Write-Log '=== Administrative Unit / security group diagnostics ===' 'OK'
+    foreach ($scope in @($script:Scopes | Where-Object Enabled | Where-Object { Test-ScopeSelected $_ })) {
         Write-Host ''
-        Write-Host "AU: $($au.name)  [$($au.auId)]" -ForegroundColor Cyan
+        Write-Host "$($scope.Kind): $($scope.Name)  [$($scope.Id)]" -ForegroundColor Cyan
 
+        $base = if ($scope.Kind -eq 'SecurityGroup') { "$GraphRes/v1.0/groups/$($scope.Id)" }
+                else { "$GraphRes/v1.0/directory/administrativeUnits/$($scope.Id)" }
         try {
-            $meta = (Invoke-Api -Uri "$GraphRes/v1.0/directory/administrativeUnits/$($au.auId)" -Resource $GraphRes).Content
+            $meta = (Invoke-Api -Uri $base -Resource $GraphRes).Content
             Write-Host "  Exists in directory as: '$($meta.displayName)'" -ForegroundColor Green
-            if ($meta.displayName -ne $au.name) {
-                Write-Host "  NOTE: config name differs from directory name. Only auId is used for lookup, so this is cosmetic." -ForegroundColor Yellow
+            if ($meta.displayName -ne $scope.Name) {
+                Write-Host "  NOTE: config name differs from directory name. Only the id is used for lookup, so this is cosmetic." -ForegroundColor Yellow
             }
         }
-        catch { Write-Host "  CANNOT READ AU: $($_.Exception.Message)" -ForegroundColor Red; continue }
+        catch { Write-Host "  CANNOT READ: $($_.Exception.Message)" -ForegroundColor Red; continue }
 
-        foreach ($probe in @(
-            @{ Label = 'members (untyped)';  Uri = "$GraphRes/v1.0/directory/administrativeUnits/$($au.auId)/members?`$top=999" }
-            @{ Label = 'members/user cast';  Uri = "$GraphRes/v1.0/directory/administrativeUnits/$($au.auId)/members/microsoft.graph.user?`$top=999" }
-            @{ Label = 'members/group cast'; Uri = "$GraphRes/v1.0/directory/administrativeUnits/$($au.auId)/members/microsoft.graph.group?`$top=999" }
-        )) {
+        $probes = if ($scope.Kind -eq 'SecurityGroup') {
+            @(
+                @{ Label = 'members (direct)';   Uri = "$base/members?`$top=999" }
+                @{ Label = 'transitive users';   Uri = "$base/transitiveMembers/microsoft.graph.user?`$top=999" }
+                @{ Label = 'nested groups';      Uri = "$base/transitiveMembers/microsoft.graph.group?`$top=999" }
+            )
+        }
+        else {
+            @(
+                @{ Label = 'members (untyped)';  Uri = "$base/members?`$top=999" }
+                @{ Label = 'members/user cast';  Uri = "$base/members/microsoft.graph.user?`$top=999" }
+                @{ Label = 'members/group cast'; Uri = "$base/members/microsoft.graph.group?`$top=999" }
+            )
+        }
+        foreach ($probe in $probes) {
             try {
                 $r = (Invoke-Api -Uri $probe.Uri -Resource $GraphRes).Content
                 $v = @($r.value)
@@ -392,7 +459,7 @@ if ($DiagnoseAu) {
         }
     }
     Write-Host ''
-    Write-Log 'Diagnostics complete. If every probe shows 0 objects but the portal shows members, the app is missing AdministrativeUnit.Read.All as an APPLICATION permission (delegated will not work) or admin consent was never granted.' 'WARN'
+    Write-Log 'Diagnostics complete. If every probe shows 0 objects but the portal shows members, the app is missing AdministrativeUnit.Read.All / GroupMember.Read.All as an APPLICATION permission (delegated will not work) or admin consent was never granted.' 'WARN'
     return
 }
 
@@ -478,7 +545,8 @@ Write-Log "Fetched $($records.Count) matching audit records." 'OK'
 $Columns = @(
     'Id','CreationTimeUtc','Date','Hour','Operation','RecordType','Workload','Activity',
     'UserId','UserType','UserKey','UserAgent','ClientIP','ClientIPCountry',
-    'AdministrativeUnit','AuId','Department','JobTitle','DisplayName','IsGuest','IsServicePrincipal',
+    'AdministrativeUnit','AuId','SecurityGroup','SecurityGroupId',
+    'Department','JobTitle','DisplayName','IsGuest','IsServicePrincipal',
     'WorkspaceId','WorkspaceName','CapacityId','CapacityName',
     'ObjectId','ItemName','ArtifactId','ArtifactName','ArtifactKind',
     'DatasetId','DatasetName','ReportId','ReportName','ReportType',
@@ -605,12 +673,22 @@ function ConvertTo-Row {
 
 $rows = @($records | ForEach-Object { ConvertTo-Row $_ })
 
-# --------------------------------------------- Administrative Unit mapping ---
-Write-Log 'Resolving Administrative Unit membership from Microsoft Graph...'
-$userToAu = @{}   # upn(lower) -> @{ Name; AuId; Department; JobTitle; DisplayName }
+# ------------------------------------------------------- scope membership ---
+Write-Log 'Resolving Administrative Unit and security group membership from Microsoft Graph...'
 $script:UserCache   = @{}
 $script:NeedUserRead = $false
-$auEnabled = @($cfg.administrativeUnits | Where-Object { $_.enabled })
+$script:ResolveFailed = $false
+$scopesEnabled = New-Object System.Collections.Generic.List[object]
+foreach ($s in $script:Scopes) {
+    # Called out because a disabled scope produces no other output at all - it is
+    # skipped before the first Graph call, which reads as "my config was ignored".
+    if ($s.Enabled) { $scopesEnabled.Add($s) }
+    else { Write-Log "$($s.Kind) '$($s.Name)': enabled is false - not resolved and not exported." 'WARN' }
+}
+# Kind -> upn/mail(lower) -> @{ Name; Id; Department; JobTitle; DisplayName }.
+# One index per kind so a user can be tagged with an AU and a security group at once.
+$memberIndex = @{ 'AdministrativeUnit' = @{}; 'SecurityGroup' = @{} }
+$UserSelect  = 'id,userPrincipalName,displayName,department,jobTitle,mail,userType'
 
 function Get-GraphAll {
     param([string]$Uri)
@@ -625,40 +703,50 @@ function Get-GraphAll {
     $out.ToArray()
 }
 
-foreach ($au in $auEnabled) {
-    $auId = [string]$au.auId
+foreach ($scope in $scopesEnabled) {
+    $sid = [string]$scope.Id
     $guidRef = [guid]::Empty
-    if (-not [guid]::TryParse($auId, [ref]$guidRef) -or $guidRef -eq [guid]::Empty) {
-        Write-Log "AU '$($au.name)': auId '$auId' is not a valid GUID - skipped. Get the correct value with: Get-MgDirectoryAdministrativeUnit | Select Id,DisplayName" 'ERROR'
+    if (-not [guid]::TryParse($sid, [ref]$guidRef) -or $guidRef -eq [guid]::Empty) {
+        $hint = if ($scope.Kind -eq 'SecurityGroup') { 'Get-MgGroup -Filter "securityEnabled eq true" | Select Id,DisplayName' }
+                else { 'Get-MgDirectoryAdministrativeUnit | Select Id,DisplayName' }
+        Write-Log "$($scope.Kind) '$($scope.Name)': id '$sid' is not a valid GUID - skipped. Get the correct value with: $hint" 'ERROR'
         continue
     }
     try {
-        $sel = 'id,userPrincipalName,displayName,department,jobTitle,mail,userType'
         $users  = New-Object System.Collections.Generic.List[object]
         $groups = New-Object System.Collections.Generic.List[object]
 
-        # Preferred: OData cast segments. Fast and returns exactly the properties we want.
-        try {
-            foreach ($u in (Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$auId/members/microsoft.graph.user?`$select=$sel&`$top=999")) { $users.Add($u) }
-            foreach ($g in (Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$auId/members/microsoft.graph.group?`$select=id,displayName&`$top=999")) { $groups.Add($g) }
+        if ($scope.Kind -eq 'SecurityGroup') {
+            # transitiveMembers flattens the entire nesting tree server-side, so every
+            # user beneath the root group is returned however deep the nesting goes.
+            foreach ($u in (Get-GraphAll "$GraphRes/v1.0/groups/$sid/transitiveMembers/microsoft.graph.user?`$select=$UserSelect&`$top=999")) { $users.Add($u) }
+            $nested = @(Get-GraphAll "$GraphRes/v1.0/groups/$sid/transitiveMembers/microsoft.graph.group?`$select=id,displayName&`$top=999")
+            Write-Log "SecurityGroup '$($scope.Name)': directory returned $($users.Count) user object(s) across $($nested.Count) nested group(s)."
         }
-        catch { Write-Log "AU '$($au.name)': cast query failed ($($_.Exception.Message)) - falling back." 'WARN' }
-
-        # Fallback: some tenants return an empty set from the cast segment even though
-        # the AU has members. Read the untyped collection and partition on @odata.type.
-        if ($users.Count -eq 0) {
-            Write-Log "AU '$($au.name)': user cast returned nothing - retrying via untyped /members." 'WARN'
-            $all = @(Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$auId/members?`$top=999")
-            Write-Log "AU '$($au.name)': untyped /members returned $($all.Count) object(s)."
-            $groups.Clear()
-            foreach ($m in $all) {
-                $t = [string](Get-Prop $m '@odata.type')
-                if ($t -match 'group')  { $groups.Add($m); continue }
-                if ($t -match 'user' -or (Get-Prop $m 'userPrincipalName') -or (Get-Prop $m 'id')) { $users.Add($m); continue }
-                Write-Log "AU '$($au.name)': ignoring member of type '$t'."
+        else {
+            # Preferred: OData cast segments. Fast and returns exactly the properties we want.
+            try {
+                foreach ($u in (Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$sid/members/microsoft.graph.user?`$select=$UserSelect&`$top=999")) { $users.Add($u) }
+                foreach ($g in (Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$sid/members/microsoft.graph.group?`$select=id,displayName&`$top=999")) { $groups.Add($g) }
             }
+            catch { Write-Log "AdministrativeUnit '$($scope.Name)': cast query failed ($($_.Exception.Message)) - falling back." 'WARN' }
+
+            # Fallback: some tenants return an empty set from the cast segment even though
+            # the AU has members. Read the untyped collection and partition on @odata.type.
+            if ($users.Count -eq 0) {
+                Write-Log "AdministrativeUnit '$($scope.Name)': user cast returned nothing - retrying via untyped /members." 'WARN'
+                $all = @(Get-GraphAll "$GraphRes/v1.0/directory/administrativeUnits/$sid/members?`$top=999")
+                Write-Log "AdministrativeUnit '$($scope.Name)': untyped /members returned $($all.Count) object(s)."
+                $groups.Clear()
+                foreach ($m in $all) {
+                    $t = [string](Get-Prop $m '@odata.type')
+                    if ($t -match 'group')  { $groups.Add($m); continue }
+                    if ($t -match 'user' -or (Get-Prop $m 'userPrincipalName') -or (Get-Prop $m 'id')) { $users.Add($m); continue }
+                    Write-Log "AdministrativeUnit '$($scope.Name)': ignoring member of type '$t'."
+                }
+            }
+            Write-Log "AdministrativeUnit '$($scope.Name)': directory returned $($users.Count) user object(s), $($groups.Count) group object(s)."
         }
-        Write-Log "AU '$($au.name)': directory returned $($users.Count) user object(s), $($groups.Count) group object(s)."
 
         # Graph silently omits properties the app cannot read. If a member object has an
         # id but no userPrincipalName, the app is missing User.Read.All - re-read the user
@@ -669,107 +757,205 @@ foreach ($au in $auEnabled) {
             if (-not $uid) { continue }
             if ($script:UserCache.ContainsKey($uid)) { $users[$i] = $script:UserCache[$uid]; continue }
             try {
-                $full = (Invoke-Api -Uri "$GraphRes/v1.0/users/$uid`?`$select=$sel" -Resource $GraphRes).Content
+                $full = (Invoke-Api -Uri "$GraphRes/v1.0/users/$uid`?`$select=$UserSelect" -Resource $GraphRes).Content
                 $script:UserCache[$uid] = $full
                 $users[$i] = $full
             }
             catch {
                 $script:NeedUserRead = $true
-                Write-Log "AU '$($au.name)': cannot read user $uid - $($_.Exception.Message)" 'ERROR'
+                Write-Log "$($scope.Kind) '$($scope.Name)': cannot read user $uid - $($_.Exception.Message)" 'ERROR'
             }
         }
 
-        # AUs may contain groups; expand them transitively
+        # AUs may contain groups; expand them transitively. Empty for a SecurityGroup
+        # scope, whose nesting Graph already flattened above.
         foreach ($g in $groups) {
             $gid = [string](Get-Prop $g 'id')
             if (-not $gid) { continue }
             $gname = [string](Get-Prop $g 'displayName')
             try {
-                $gm = @(Get-GraphAll "$GraphRes/v1.0/groups/$gid/transitiveMembers/microsoft.graph.user?`$select=$sel&`$top=999")
-                Write-Log "AU '$($au.name)': group '$gname' expanded to $($gm.Count) user(s)."
+                $gm = @(Get-GraphAll "$GraphRes/v1.0/groups/$gid/transitiveMembers/microsoft.graph.user?`$select=$UserSelect&`$top=999")
+                Write-Log "AdministrativeUnit '$($scope.Name)': group '$gname' expanded to $($gm.Count) user(s)."
                 foreach ($u in $gm) { $users.Add($u) }
             }
             catch {
-                Write-Log "AU '$($au.name)': cannot expand group '$gname' ($gid) - add GroupMember.Read.All as an application permission. $($_.Exception.Message)" 'ERROR'
+                Write-Log "AdministrativeUnit '$($scope.Name)': cannot expand group '$gname' ($gid) - add GroupMember.Read.All as an application permission. $($_.Exception.Message)" 'ERROR'
             }
         }
 
+        # First scope of a kind wins, so overlapping AUs (or overlapping groups) resolve
+        # deterministically in config order.
+        $map = $memberIndex[$scope.Kind]
         $added = 0; $noUpn = 0
         foreach ($u in $users) {
             $upn = ([string](Get-Prop $u 'userPrincipalName')).ToLowerInvariant()
             if (-not $upn) { $noUpn++; continue }
-            if ($userToAu.ContainsKey($upn)) { continue }
-            $userToAu[$upn] = @{
-                Name = $au.name; AuId = $auId
+            if ($map.ContainsKey($upn)) { continue }
+            $map[$upn] = @{
+                Name = $scope.Name; Id = $sid
                 Department  = (Get-Prop $u 'department')
                 JobTitle    = (Get-Prop $u 'jobTitle')
                 DisplayName = (Get-Prop $u 'displayName')
             }
             $added++
             $mail = ([string](Get-Prop $u 'mail')).ToLowerInvariant()
-            if ($mail -and -not $userToAu.ContainsKey($mail)) { $userToAu[$mail] = $userToAu[$upn] }
+            if ($mail -and -not $map.ContainsKey($mail)) { $map[$mail] = $map[$upn] }
         }
-        if ($noUpn) { Write-Log "AU '$($au.name)': $noUpn object(s) had no readable userPrincipalName and were skipped." 'WARN' }
+        if ($noUpn) { Write-Log "$($scope.Kind) '$($scope.Name)': $noUpn object(s) had no readable userPrincipalName and were skipped." 'WARN' }
         if ($added -eq 0) {
-            Write-Log "AU '$($au.name)': 0 members mapped." 'WARN'
+            Write-Log "$($scope.Kind) '$($scope.Name)': 0 members mapped." 'WARN'
         }
-        else { Write-Log "AU '$($au.name)': $added members mapped." 'OK' }
+        else { Write-Log "$($scope.Kind) '$($scope.Name)': $added members mapped." 'OK' }
     }
-    catch { Write-Log "Failed to read AU '$($au.name)' ($auId): $($_.Exception.Message)" 'ERROR' }
-}
-
-foreach ($r in $rows) {
-    $key = ([string]$r.UserId).ToLowerInvariant()
-    if ($key -and $userToAu.ContainsKey($key)) {
-        $m = $userToAu[$key]
-        $r.AdministrativeUnit = $m.Name; $r.AuId = $m.AuId
-        $r.Department = $m.Department;  $r.JobTitle = $m.JobTitle; $r.DisplayName = $m.DisplayName
-    }
-    else {
-        $r.AdministrativeUnit = 'Unassigned'; $r.AuId = ''
+    catch {
+        $script:ResolveFailed = $true
+        Write-Log "Failed to read $($scope.Kind) '$($scope.Name)' ($sid): $($_.Exception.Message)" 'ERROR'
     }
 }
-Write-Log ("Mapped {0} of {1} records to an Administrative Unit." -f (@($rows | Where-Object AdministrativeUnit -ne 'Unassigned').Count), $rows.Count)
 
-if ($userToAu.Count -eq 0) {
+$auIndex = $memberIndex['AdministrativeUnit']
+$sgIndex = $memberIndex['SecurityGroup']
+
+# Returns $true when any tag on the row actually changed, which is what tells the raw
+# store a rewrite is warranted.
+function Set-RowScope {
+    param($Row)
+    $key = ([string](Get-Prop $Row 'UserId')).ToLowerInvariant()
+    $au  = if ($key) { $auIndex[$key] } else { $null }
+    $sg  = if ($key) { $sgIndex[$key] } else { $null }
+    # Directory attributes are the user's own, so either index can supply them.
+    $who = if ($au) { $au } else { $sg }
+
+    $tags = [ordered]@{
+        AdministrativeUnit = $(if ($au)  { [string]$au.Name }        else { 'Unassigned' })
+        AuId               = $(if ($au)  { [string]$au.Id }          else { '' })
+        SecurityGroup      = $(if ($sg)  { [string]$sg.Name }        else { 'Unassigned' })
+        SecurityGroupId    = $(if ($sg)  { [string]$sg.Id }          else { '' })
+        Department         = $(if ($who) { [string]$who.Department } else { '' })
+        JobTitle           = $(if ($who) { [string]$who.JobTitle }   else { '' })
+        DisplayName        = $(if ($who) { [string]$who.DisplayName } else { '' })
+    }
+
+    $changed = $false
+    foreach ($c in @($tags.Keys)) {
+        if ([string](Get-Prop $Row $c) -ne $tags[$c]) { $changed = $true }
+        $Row.$c = $tags[$c]
+    }
+    $changed
+}
+
+foreach ($r in $rows) { [void](Set-RowScope $r) }
+Write-Log ("Mapped {0} of {2} records to an Administrative Unit, {1} to a security group." -f `
+    (@($rows | Where-Object AdministrativeUnit -ne 'Unassigned').Count),
+    (@($rows | Where-Object SecurityGroup -ne 'Unassigned').Count),
+    $rows.Count)
+
+if ($auIndex.Count + $sgIndex.Count -eq 0) {
     Write-Log '' 'ERROR'
-    Write-Log 'NO AU MEMBERS COULD BE RESOLVED.' 'ERROR'
+    Write-Log 'NO SCOPE MEMBERS COULD BE RESOLVED.' 'ERROR'
     if ($script:NeedUserRead) {
         Write-Log "Graph returned member objects but withheld userPrincipalName. The app registration is missing the Microsoft Graph APPLICATION permission 'User.Read.All'." 'ERROR'
     }
     else {
-        Write-Log "Graph returned member objects without a readable userPrincipalName. This is almost always the missing Microsoft Graph APPLICATION permission 'User.Read.All' - AdministrativeUnit.Read.All alone reveals that a member exists, but not who they are." 'ERROR'
+        Write-Log "Graph returned member objects without a readable userPrincipalName. This is almost always the missing Microsoft Graph APPLICATION permission 'User.Read.All' - AdministrativeUnit.Read.All / GroupMember.Read.All alone reveal that a member exists, but not who they are." 'ERROR'
     }
     Write-Log "Fix: Entra portal -> App registrations -> your app -> API permissions -> Add -> Microsoft Graph -> Application permissions -> User.Read.All -> Add -> Grant admin consent." 'ERROR'
 }
 
 # Show who could not be matched - the fastest way to spot a UPN/alias mismatch.
-$unmatched = @($rows | Where-Object AdministrativeUnit -eq 'Unassigned' |
+$unmatched = @($rows | Where-Object { $_.AdministrativeUnit -eq 'Unassigned' -and $_.SecurityGroup -eq 'Unassigned' } |
                 Select-Object -ExpandProperty UserId -Unique | Where-Object { $_ })
 if ($unmatched.Count) {
     $g = [guid]::Empty
     $spns  = @($unmatched | Where-Object { [guid]::TryParse($_, [ref]$g) -or $_ -notmatch '@' })
     $human = @($unmatched | Where-Object { $_ -notin $spns })
-    Write-Log "$($human.Count) unmatched user(s), $($spns.Count) service principal(s)/system account(s). AU directory holds $($userToAu.Count) identity key(s)." 'WARN'
+    Write-Log "$($human.Count) unmatched user(s), $($spns.Count) service principal(s)/system account(s). Directory holds $($auIndex.Count) AU and $($sgIndex.Count) security group identity key(s)." 'WARN'
     foreach ($u in ($human | Select-Object -First 15)) { Write-Log "    unmatched user: $u" }
     if ($human.Count -gt 15) { Write-Log "    ... and $($human.Count - 15) more." }
     if ($spns.Count) { Write-Log "    (service principals never belong to an AU - this is expected)" }
 }
 
 # ------------------------------------ append to central raw store (deduped) ---
+# Scope tags are written at ingest, so rows already in the store keep whatever mapping
+# was in force when they landed - a scope added later would only ever see records
+# fetched after it was added. Fingerprint the resolved mapping so a change to it
+# re-tags the history instead of silently stranding it.
+$sigText = New-Object System.Text.StringBuilder
+foreach ($kind in 'AdministrativeUnit', 'SecurityGroup') {
+    foreach ($k in ($memberIndex[$kind].Keys | Sort-Object)) {
+        [void]$sigText.AppendLine("$kind`t$k`t$($memberIndex[$kind][$k].Name)")
+    }
+}
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try   { $mapSignature = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($sigText.ToString()))).Replace('-', '') }
+finally { $sha.Dispose() }
+$lastSignature = if ($state.PSObject.Properties.Name -contains 'mapSignature') { [string]$state.mapSignature } else { '' }
+$retagAll = ($mapSignature -ne $lastSignature)
+
+# Normalises one raw file to the current column set and re-applies the scope tags.
+function Update-RawFileTags {
+    param([string]$Path)
+    $have  = @(((Get-Content -LiteralPath $Path -TotalCount 1) -split ',') | ForEach-Object { $_.Trim('"') })
+    # Export-Csv -Append matches the file's existing header, so a file written before a
+    # column was added silently drops it. Detect that and rewrite instead.
+    $stale = @($Columns | Where-Object { $have -notcontains $_ }).Count -gt 0
+    $out = New-Object System.Collections.Generic.List[object]
+    $changed = 0
+    foreach ($e in (Import-Csv -LiteralPath $Path)) {
+        $row = $e
+        if ($stale) {
+            $o = [ordered]@{}
+            foreach ($c in $Columns) { $o[$c] = Get-Prop $e $c }
+            $row = [pscustomobject]$o
+        }
+        if (Set-RowScope $row) { $changed++ }
+        $out.Add($row)
+    }
+    @{ Rows = $out; Changed = $changed; StaleSchema = $stale }
+}
+
 $touchedDates = @{}
 foreach ($grp in ($rows | Group-Object Date)) {
     $file = Join-Path $rawPath ("{0}.csv" -f $grp.Name)
+    $touchedDates[$grp.Name] = $true
+    $existing = New-Object System.Collections.Generic.List[object]
     $existingIds = @{}
+    $retagged = 0
+    $staleSchema = $false
     if (Test-Path -LiteralPath $file) {
-        foreach ($e in (Import-Csv -LiteralPath $file)) { $existingIds[$e.Id] = $true }
+        $r = Update-RawFileTags -Path $file
+        $existing = $r.Rows; $retagged = $r.Changed; $staleSchema = $r.StaleSchema
+        foreach ($e in $existing) { $existingIds[$e.Id] = $true }
     }
     $new = @($grp.Group | Where-Object { -not $existingIds.ContainsKey($_.Id) })
-    if ($new.Count -eq 0) { Write-Log "Raw $($grp.Name): no new records."; continue }
-    if (Test-Path -LiteralPath $file) { $new | Export-Csv -LiteralPath $file -NoTypeInformation -Append -Encoding UTF8 }
-    else                              { $new | Export-Csv -LiteralPath $file -NoTypeInformation -Encoding UTF8 }
-    $touchedDates[$grp.Name] = $true
-    Write-Log "Raw $($grp.Name): +$($new.Count) records." 'OK'
+    if ($new.Count -eq 0 -and $retagged -eq 0 -and -not $staleSchema) { Write-Log "Raw $($grp.Name): no new records."; continue }
+
+    if ($retagged -or $staleSchema) {
+        foreach ($n in $new) { $existing.Add($n) }
+        $existing | Export-Csv -LiteralPath $file -NoTypeInformation -Encoding UTF8
+        $note = if ($staleSchema) { ", schema updated" } else { '' }
+        Write-Log "Raw $($grp.Name): +$($new.Count) records, $retagged row(s) re-tagged$note." 'OK'
+    }
+    else {
+        if (Test-Path -LiteralPath $file) { $new | Export-Csv -LiteralPath $file -NoTypeInformation -Append -Encoding UTF8 }
+        else                              { $new | Export-Csv -LiteralPath $file -NoTypeInformation -Encoding UTF8 }
+        Write-Log "Raw $($grp.Name): +$($new.Count) records." 'OK'
+    }
+}
+
+if ($retagAll -and $script:ResolveFailed) {
+    Write-Log 'Scope mapping changed, but at least one scope failed to resolve this run - skipping the raw store re-tag rather than blanking history from a partial read. It will run again once every scope resolves.' 'WARN'
+}
+elseif ($retagAll) {
+    Write-Log 'Scope mapping changed since the last run - re-tagging existing rows in the raw store.'
+    foreach ($f in (Get-ChildItem -LiteralPath $rawPath -Filter '*.csv' -ErrorAction SilentlyContinue)) {
+        $d = [IO.Path]::GetFileNameWithoutExtension($f.Name)
+        if ($touchedDates.ContainsKey($d)) { continue }
+        $r = Update-RawFileTags -Path $f.FullName
+        if ($r.Rows.Count -eq 0 -or ($r.Changed -eq 0 -and -not $r.StaleSchema)) { continue }
+        $r.Rows | Export-Csv -LiteralPath $f.FullName -NoTypeInformation -Encoding UTF8
+        Write-Log "Raw $($d): $($r.Changed) row(s) re-tagged." 'OK'
+    }
 }
 
 # ------------------------------------------- per-AU export, schedule-gated ---
@@ -779,7 +965,7 @@ function Get-ConfigDate {
     $d = [datetime]::MinValue
     if (-not [datetime]::TryParseExact($Value, 'yyyy-MM-dd', [cultureinfo]::InvariantCulture,
             [System.Globalization.DateTimeStyles]::None, [ref]$d)) {
-        throw "AU '$($Au.name)': '$Field' must be an ISO date (yyyy-MM-dd), got '$Value'."
+        throw "Scope '$($Au.name)': '$Field' must be an ISO date (yyyy-MM-dd), got '$Value'."
     }
     $d.Date
 }
@@ -800,10 +986,10 @@ function Get-Period {
     if ($Mode -eq 'Custom') {
         $cs = [string](Get-Prop $Au 'periodStart')
         $ce = [string](Get-Prop $Au 'periodEnd')
-        if (-not $cs) { throw "AU '$($Au.name)': schedule 'Custom' requires 'periodStart' (yyyy-MM-dd) in config.json." }
+        if (-not $cs) { throw "Scope '$($Au.name)': schedule 'Custom' requires 'periodStart' (yyyy-MM-dd) in config.json." }
         $s = Get-ConfigDate -Value $cs -Field 'periodStart' -Au $Au
         $e = if ($ce) { Get-ConfigDate -Value $ce -Field 'periodEnd' -Au $Au } else { $today }
-        if ($e -lt $s) { throw "AU '$($Au.name)': periodEnd '$ce' is before periodStart '$cs'." }
+        if ($e -lt $s) { throw "Scope '$($Au.name)': periodEnd '$ce' is before periodStart '$cs'." }
         return @{ Start = $s; End = $e; Mode = 'Custom' }
     }
 
@@ -859,29 +1045,36 @@ $exportState = @{}
 if ($state.PSObject.Properties.Name -contains 'exports' -and $state.exports) {
     foreach ($p in $state.exports.PSObject.Properties) { $exportState[$p.Name] = [string]$p.Value }
 }
-function Get-ExportKey { param($Au, [string]$Mode) "$($Au.name)|$Mode" }
+# AU keys keep their original shape so entries already in _state.json stay valid; only
+# security groups take a prefix, which also keeps a group and an AU of the same name apart.
+function Get-ExportKey {
+    param($Scope, [string]$Mode)
+    if ($Scope.Kind -eq 'SecurityGroup') { "SG:$($Scope.Name)|$Mode" } else { "$($Scope.Name)|$Mode" }
+}
 # Both ends identify the period, so editing a Custom range re-triggers its export.
 function Get-PeriodToken { param($Period) '{0:yyyy-MM-dd}_{1:yyyy-MM-dd}' -f $Period.Start, $Period.End }
 
 function Test-Due {
-    param([string]$Mode, $Au, [datetime]$Now, $Period)
+    param([string]$Mode, $Scope, [datetime]$Now, $Period)
     if ($Force) { return $true }
-    $k = Get-ExportKey -Au $Au -Mode $Mode
+    $k = Get-ExportKey -Scope $Scope -Mode $Mode
     if (-not $exportState.ContainsKey($k)) { return $true }
     return ($exportState[$k] -ne (Get-PeriodToken $Period))
 }
 
 $manifest = New-Object System.Collections.Generic.List[object]
 
-if ($script:AuFilter) { Write-Log "Export restricted to: $($script:AuFilter -join ', ')" 'WARN' }
+foreach ($kind in $script:ScopeFilter.Keys) { Write-Log "Export restricted to $kind : $($script:ScopeFilter[$kind] -join ', ')" 'WARN' }
 
-foreach ($au in $auEnabled) {
-    if (-not (Test-AuSelected $au)) { continue }
+foreach ($scope in $scopesEnabled) {
+    if (-not (Test-ScopeSelected $scope)) { continue }
+    $au = $scope.Config
+    $tagColumn = if ($scope.Kind -eq 'SecurityGroup') { 'SecurityGroup' } else { 'AdministrativeUnit' }
     $mode = if ($au.PSObject.Properties.Name -contains 'schedule' -and $au.schedule) { [string]$au.schedule } else { 'Daily' }
     $p = Get-Period -Mode $mode -Now $localNow -Au $au
     $label = if ($p.Mode -and $p.Mode -ne $mode) { "$mode/$($p.Mode)" } else { $mode }
-    if (-not (Test-Due -Mode $mode -Au $au -Now $localNow -Period $p)) {
-        Write-Log "AU '$($au.name)' ($label): $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) already exported - skipped."
+    if (-not (Test-Due -Mode $mode -Scope $scope -Now $localNow -Period $p)) {
+        Write-Log "$($scope.Kind) '$($scope.Name)' ($label): $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) already exported - skipped."
         continue
     }
     $days = @(); for ($d = $p.Start; $d -le $p.End; $d = $d.AddDays(1)) { $days += $d.ToString('yyyy-MM-dd') }
@@ -890,30 +1083,34 @@ foreach ($au in $auEnabled) {
     foreach ($d in $days) {
         $f = Join-Path $rawPath "$d.csv"
         if (Test-Path -LiteralPath $f) {
-            foreach ($r in (Import-Csv -LiteralPath $f | Where-Object { $_.AdministrativeUnit -eq $au.name })) { $auRows.Add($r) }
+            foreach ($r in (Import-Csv -LiteralPath $f | Where-Object { (Get-Prop $_ $tagColumn) -eq $scope.Name })) { $auRows.Add($r) }
         }
     }
 
     $fileName = 'FabricAudit_{0}_{1}_{2:yyyyMMdd}_{3:yyyyMMdd}.csv' -f `
-        (($au.name -replace '[^\w\-]', '_')), $mode, $p.Start, $p.End
+        (($scope.Name -replace '[^\w\-]', '_')), $mode, $p.Start, $p.End
     $dest = Join-Path $au.outputPath $fileName
 
     if ($WhatIfExport) { Write-Log "[WhatIf] would write $($auRows.Count) rows -> $dest"; continue }
 
     if ($auRows.Count -eq 0 -and $skipEmpty) {
-        Write-Log "AU '$($au.name)' ($label): 0 rows for $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) - nothing written."
+        Write-Log "$($scope.Kind) '$($scope.Name)' ($label): 0 rows for $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) - nothing written."
         continue
     }
 
     try {
         New-Folder $au.outputPath
         $auRows | Export-Csv -LiteralPath $dest -NoTypeInformation -Encoding UTF8
-        Write-Log "AU '$($au.name)' ($label): $($auRows.Count) rows for $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) -> $dest" 'OK'
+        Write-Log "$($scope.Kind) '$($scope.Name)' ($label): $($auRows.Count) rows for $($p.Start.ToString('yyyy-MM-dd'))..$($p.End.ToString('yyyy-MM-dd')) -> $dest" 'OK'
 
         # Power BI watch-folder trigger: refresh as soon as the file lands
         $trigger = [pscustomobject]@{
-            administrativeUnit = $au.name
-            auId               = $au.auId
+            scopeKind          = $scope.Kind
+            scopeName          = $scope.Name
+            scopeId            = $scope.Id
+            administrativeUnit = $scope.Name   # kept for existing Power BI bindings
+            auId               = $(if ($scope.Kind -eq 'AdministrativeUnit') { $scope.Id } else { '' })
+            groupId            = $(if ($scope.Kind -eq 'SecurityGroup')      { $scope.Id } else { '' })
             schedule           = $mode
             periodMode         = $p.Mode
             periodStart        = $p.Start.ToString('yyyy-MM-dd')
@@ -927,18 +1124,18 @@ foreach ($au in $auEnabled) {
 
         # Mark the period done only after a successful write. A failed or skipped
         # export stays pending so the next run retries it.
-        $exportState[(Get-ExportKey -Au $au -Mode $mode)] = Get-PeriodToken $p
+        $exportState[(Get-ExportKey -Scope $scope -Mode $mode)] = Get-PeriodToken $p
 
         # retention
         Get-ChildItem -LiteralPath $au.outputPath -Filter 'FabricAudit_*.csv' -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -lt $localNow.AddDays(-$retentionDays) } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
-    catch { Write-Log "AU '$($au.name)': export failed -> $dest : $_" 'ERROR' }
+    catch { Write-Log "$($scope.Kind) '$($scope.Name)': export failed -> $dest : $_" 'ERROR' }
 }
 
-if ($inclUnassigned -and -not $script:AuFilter) {
-    $un = @($rows | Where-Object AdministrativeUnit -eq 'Unassigned')
+if ($inclUnassigned -and $script:ScopeFilter.Count -eq 0) {
+    $un = @($rows | Where-Object { $_.AdministrativeUnit -eq 'Unassigned' -and $_.SecurityGroup -eq 'Unassigned' })
     if ($un.Count) {
         $unPath = Join-Path $cfg.centralPath 'Unassigned'
         New-Folder $unPath
@@ -959,7 +1156,9 @@ Get-ChildItem -LiteralPath $rawPath -Filter '*.csv' -ErrorAction SilentlyContinu
 
 # ------------------------------------------------------------ save state ---
 if (-not $WhatIfExport -and -not $StartUtc) {
-    @{ lastRunUtc = $winEnd.ToString('o'); lastRecordCount = $rows.Count; exports = $exportState } |
+    # Keep the old signature when the re-tag was skipped, so the next run retries it.
+    $sigToSave = if ($retagAll -and $script:ResolveFailed) { $lastSignature } else { $mapSignature }
+    @{ lastRunUtc = $winEnd.ToString('o'); lastRecordCount = $rows.Count; exports = $exportState; mapSignature = $sigToSave } |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $cfg.stateFile -Encoding UTF8
 }
 Write-Log "=== Completed. $($rows.Count) records processed. ===" 'OK'
